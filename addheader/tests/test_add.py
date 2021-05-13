@@ -132,3 +132,15 @@ def test_cli(tmp_path):
         addheader.add.main()
 
 
+@pytest.mark.parametrize("line_ending", ["\n", "\r\n"])
+def test_newlines_programmatic(tmp_path, line_ending):
+    # create files with \r\n newlines
+    hello = tmp_path / "hello.txt"
+    with hello.open("w", newline="") as f:
+        f.write("hello, world" + line_ending)
+    fmod = add.FileModifier("header" + line_ending)
+    fmod.replace(hello)
+    text = hello.open("r", newline="").read()
+    # line-endings should be preserved
+    assert ("header" + line_ending) in text
+    assert ("hello, world" + line_ending) in text

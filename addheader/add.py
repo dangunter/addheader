@@ -178,6 +178,7 @@ class FileModifier:
         comment_prefix=DEFAULT_COMMENT,
         delim_char=DEFAULT_DELIM_CHAR,
         delim_len=DEFAULT_DELIM_LEN,
+        universal_newlines=True
     ):
         """Constructor.
 
@@ -194,6 +195,7 @@ class FileModifier:
             text = "..."
         lines = [l.strip() for l in text.split("\n")]
         self._txt = "\n".join([f"{self._pfx} {line}".strip() for line in lines])
+        self._newline = None if universal_newlines else ""
 
     def replace(self, path: Path):
         """Modify header in the file at 'path'.
@@ -231,7 +233,7 @@ class FileModifier:
         _log.debug(f"Remove header from file: {path}")
         return self._process(path, mode="detect")
 
-    def _process(self, path, mode) -> bool:
+    def _process(self, path, mode, encoding="utf8", newline=None) -> bool:
         # move input file to <name>.orig
         if mode == "detect":
             f = path.open("r", encoding="utf8")
@@ -247,8 +249,8 @@ class FileModifier:
                 _log.error("Abort file modification loop")
                 return False
             # re-open input filename as the output file
-            f = open(wfname, "r", encoding="utf8")
-            out = open(fname, "w", encoding="utf8")
+            f = open(wfname, "r", encoding=encoding, newline=newline)
+            out = open(fname, "w", encoding=encoding, newline=newline)
         # re-create the file, modified
         state, lineno = "pre", 0
         detected, line_stripped = False, ""
