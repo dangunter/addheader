@@ -49,6 +49,7 @@ In this file he notice will be inserted before the first line::
 import argparse
 from collections import deque
 from fnmatch import fnmatch
+from io import StringIO
 import logging
 import os
 from pathlib import Path
@@ -57,6 +58,7 @@ import shutil
 import sys
 from typing import List, Union, Optional
 from uuid import uuid4
+
 # third-party
 import yaml
 from yaml import Loader
@@ -178,7 +180,7 @@ class FileModifier:
         comment_prefix=DEFAULT_COMMENT,
         delim_char=DEFAULT_DELIM_CHAR,
         delim_len=DEFAULT_DELIM_LEN,
-        universal_newlines=True
+        convert_newlines=False,
     ):
         """Constructor.
 
@@ -187,15 +189,23 @@ class FileModifier:
             comment_prefix: Character(s) the start of a line that indicates a comment
             delim_char: Character to repeat for the delimiter line
             delim_len: Number of `delim_char` characters to put together to make a delimiter line
+            convert_newlines: If True, change newlines to system/platform default.
         """
         self._pfx = comment_prefix
         self._sep = comment_prefix + delim_char * delim_len
         self._minsep = comment_prefix + delim_char * self.DELIM_MINLEN
         if text is None:
             text = "..."
-        lines = [l.strip() for l in text.split("\n")]
-        self._txt = "\n".join([f"{self._pfx} {line}".strip() for line in lines])
-        self._newline = None if universal_newlines else ""
+        else:
+            # use StringIO to convert to universal newlines
+            text = StringIO(initial_value=text, newline=None).getvalue()
+        self._txt_lines = [l.strip() for l in text.split("\n")]
+        if self._txt_lines[-1] == "":
+            self._txt_lines = self._txt_lines[:-1]
+        #
+        self._newline = None if convert_newlines else ""
+        self._encoding = "utf8"
+        self._file_linesep = os.linesep if convert_newlines else None
 
     def replace(self, path: Path):
         """Modify header in the file at 'path'.
@@ -233,10 +243,10 @@ class FileModifier:
         _log.debug(f"Remove header from file: {path}")
         return self._process(path, mode="detect")
 
-    def _process(self, path, mode, encoding="utf8", newline=None) -> bool:
+    def _process(self, path, mode) -> bool:
         # move input file to <name>.orig
         if mode == "detect":
-            f = path.open("r", encoding="utf8")
+            f = path.open("r", encoding=self._encoding)
             out, fname, wfname = None, None, None
         else:
             random_str = uuid4().hex
@@ -249,8 +259,8 @@ class FileModifier:
                 _log.error("Abort file modification loop")
                 return False
             # re-open input filename as the output file
-            f = open(wfname, "r", encoding=encoding, newline=newline)
-            out = open(fname, "w", encoding=encoding, newline=newline)
+            f = open(wfname, "r", encoding=self._encoding, newline=self._newline)
+            out = open(fname, "w", encoding=self._encoding, newline="")
         # re-create the file, modified
         state, lineno = "pre", 0
         detected, line_stripped = False, ""
@@ -258,12 +268,14 @@ class FileModifier:
             # Main loop
             for line in f:
                 line_stripped = line.strip()
+                if self._file_linesep is None:
+                    self._deduce_linesep(line)
                 if state == "pre":
                     if line_stripped.startswith(self._minsep):  # start of header
                         state = "header"
                     elif lineno < 3 and self.magic_expr.match(line_stripped):
                         if mode != "detect":
-                            out.write(line)
+                            self._write_line(out, line_stripped, line)
                     else:
                         state = "post"  # no header, will copy rest of file
                     # if we changed state, write the header (or skip it)
@@ -271,7 +283,7 @@ class FileModifier:
                         self._write_header(out)
                     if state == "post" and mode != "detect":
                         # no header, so write last line of text below header
-                        out.write(line)
+                        self._write_line(out, line_stripped, line)
                 elif state == "header":
                     # none of the modes write the old header
                     if line_stripped.startswith(self._minsep):  # end of header
@@ -280,7 +292,7 @@ class FileModifier:
                 elif state == "post":
                     # replace/remove both copy all lines after header
                     if mode != "detect":
-                        out.write(line)
+                        self._write_line(out, line_stripped, line)
                 lineno += 1
         except UnicodeDecodeError as err:
             _log.error(f"File {path}:{lineno} error: {err}")
@@ -302,13 +314,32 @@ class FileModifier:
             os.unlink(wfname)
         return detected
 
+    def _write_line(self, out, stripped_line, line):
+        if self._newline is None:
+            out.write(stripped_line)
+            out.write(os.linesep)
+        else:
+            out.write(line)
+
     def _write_header(self, outfile):
         outfile.write(self._sep)
-        outfile.write("\n")
-        outfile.write(self._txt)
-        outfile.write("\n")
+        outfile.write(self._file_linesep)
+        # make sure text honors the desired line separator
+        for line in self._txt_lines:
+            outfile.write(self._pfx + " " + line + self._file_linesep)
         outfile.write(self._sep)
-        outfile.write("\n")
+        outfile.write(self._file_linesep)
+
+    def _deduce_linesep(self, line):
+        if line.endswith("\r\n"):
+            self._file_linesep = "\r\n"
+        elif line.endswith("\r"):
+            self._file_linesep = "\r"
+        elif line.endswith("\n"):
+            self._file_linesep = "\n"
+        else:
+            self._file_linesep = os.linesep
+        fls = self._file_linesep.replace("\r", "\\r").replace("\n", "\\n")
 
 
 # CLI usage
@@ -327,12 +358,31 @@ def main() -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument("root", help="Root path from which to find files", nargs="?")
-    p.add_argument("-c", "--config", help=f"Configuration file (default={DEFAULT_CONF})")
     p.add_argument(
         "-t",
         "--text",
         help="File containing header text. "
         "Ignored if --dry-run or --remove options are given.",
+    )
+    p.add_argument(
+        "-c", "--config", help=f"Configuration file (default={DEFAULT_CONF})"
+    )
+    p.add_argument(
+        "--comment", help=f"Comment prefix (default='{FileModifier.DEFAULT_COMMENT})'"
+    )
+    linesep_str = os.linesep.replace("\n", "\\n").replace("\r", "\\r")  # visible
+    p.add_argument(
+        "-e",
+        "--edit-newlines",
+        action="store_true",
+        help=f"If given, change newlines in output files to system default = '{linesep_str}'",
+    )
+    p.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        dest="dry",
+        help="Do not modify files, just show which files would be affected",
     )
     p.add_argument(
         "-p",
@@ -344,26 +394,22 @@ def main() -> int:
         "(default = *.py, ~__init__.py)",
     )
     p.add_argument(
-        "-n",
-        "--dry-run",
-        action="store_true",
-        dest="dry",
-        help="Do not modify files, just show which files would be affected",
-    )
-    p.add_argument(
         "-r",
         "--remove",
         action="store_true",
         dest="remove",
         help="Remove headers from files, but do not replace them with anything",
     )
-    p.add_argument("--comment",
-                   help=f"Comment prefix (default='{FileModifier.DEFAULT_COMMENT})'")
-    p.add_argument("--sep",
-                   help=f"Separator character (default='{FileModifier.DEFAULT_DELIM_CHAR})'")
-    p.add_argument("--sep-len",
-                   type=int, default=-1,
-                   help=f"Separator length (default={FileModifier.DEFAULT_DELIM_LEN})")
+    p.add_argument(
+        "--sep",
+        help=f"Separator character (default='{FileModifier.DEFAULT_DELIM_CHAR})'",
+    )
+    p.add_argument(
+        "--sep-len",
+        type=int,
+        default=-1,
+        help=f"Separator length (default={FileModifier.DEFAULT_DELIM_LEN})",
+    )
     p.add_argument(
         "-v",
         "--verbose",
@@ -393,7 +439,9 @@ def main() -> int:
             with config_file.open() as f:
                 config_data = yaml.load(f, Loader=Loader)
         except IOError as err:
-            p.error(f"Cannot open configuration file '{config_file.name}' for reading: {err}")
+            p.error(
+                f"Cannot open configuration file '{config_file.name}' for reading: {err}"
+            )
         except yaml.YAMLError:
             p.error(f"Syntax error in configuration file '{config_file.name}': {err}")
     else:
@@ -407,8 +455,10 @@ def main() -> int:
         try:
             vb = int(config_data["verbose"])
         except ValueError:
-            p.error(f"Invalid value for verbose = '{config_data['verbose']}' "
-                    f"in configuration file '{config_file.name}'")
+            p.error(
+                f"Invalid value for verbose = '{config_data['verbose']}' "
+                f"in configuration file '{config_file.name}'"
+            )
     if config_data.get("quiet", None) or args.quiet:
         _log.setLevel(logging.FATAL)
         g_quiet = True
@@ -444,8 +494,29 @@ def main() -> int:
         except Exception as err:
             p.error(f"Cannot read text file: {args.text}: {err}")
 
+    # Root
+    if args.root:
+        root_dir = args.root
+    elif "root" in config_data:
+        root_dir = config_data["root"]
+    else:
+        p.error("Root directory not found on command-line or configuration file")
+
+    # Single file or directory + patterns?
+    patterns = None
+    root_path = Path(root_dir).expanduser()
+    if root_path.is_file():
+        if args.pattern:
+            p.error("-p/--pattern argument cannot be used with a single file")
+        patterns = [root_dir]
+        root_dir = "."
+    elif not root_path.exists():
+        p.error(f"File or directory '{root_dir}' not found")
+
     # Check input patterns
-    if len(args.pattern) == 0:
+    if patterns:
+        pass  # already set
+    elif not args.pattern:
         if "pattern" in config_data:
             patterns = config_data["pattern"]
         elif "patterns" in config_data:  # tolerate this alias
@@ -459,17 +530,11 @@ def main() -> int:
         if os.path.sep in pat:
             p.error('bad pattern "{}": must be a filename, not a path'.format(pat))
 
-    # Root
-    if args.root:
-        root_dir = args.root
-    elif "root" in config_data:
-        root_dir = config_data["root"]
-    else:
-        p.error("Root directory not found on command-line or configuration file")
-
     # Initialize file-finder
+    if _log.isEnabledFor(logging.INFO) and not root_path.is_file():
+        tell_user(f"Searching for files in '{root_dir}' ...")
     try:
-        finder = FileFinder(root_dir, glob_patterns=patterns)
+        finder = FileFinder(root_path, glob_patterns=patterns)
     except Exception as err:
         p.error(f"Finding files: {err}")
     if len(finder) == 0:
@@ -480,9 +545,14 @@ def main() -> int:
 
     # Find and replace files
     if args.dry:
-        file_list = visit_files(finder, tell_user)
+        if _log.isEnabledFor(logging.INFO):
+            print_func, verbose_msg = tell_user, ""
+        else:
+            print_func = lambda x: None
+            verbose_msg = " (add -v to see files)"
+        file_list = visit_files(finder, print_func)
         plural = "s" if len(file_list) > 1 else ""
-        tell_user(f"Found {len(file_list)} file{plural}")
+        tell_user(f"Found {len(file_list)} file{plural}{verbose_msg}")
     else:
         kwargs = {}
         if args.comment:
@@ -493,6 +563,10 @@ def main() -> int:
             kwargs["delim_char"] = args.sep[0]
         elif "sep" in config_data:
             kwargs["delim_char"] = config_data["sep"]
+        if args.edit_newlines:
+            kwargs["convert_newlines"] = True
+        elif "edit_newlines" in config_data:
+            kwargs["convert_newlines"] = True
         sep_len = None
         if args.sep_len > 0:
             sep_len = args.sep_len
@@ -500,18 +574,25 @@ def main() -> int:
             try:
                 sep_len = int(config_data["sep-len"])
             except ValueError:
-                p.error(f"Bad value for 'sep-len', expected number got: {config_data['sep-len']}")
+                p.error(
+                    f"Bad value for 'sep-len', expected number got: {config_data['sep-len']}"
+                )
         if sep_len is not None:
             if sep_len < FileModifier.DELIM_MINLEN:
-                p.error(f"Separator length from '--sep-len' option must be >= {FileModifier.DELIM_MINLEN}")
+                p.error(
+                    f"Separator length from '--sep-len' option must be >= {FileModifier.DELIM_MINLEN}"
+                )
             kwargs["delim_len"] = sep_len
         modifier = FileModifier(notice_text, **kwargs)
         modifier_func = modifier.remove if args.remove else modifier.replace
         file_list = visit_files(finder, modifier_func)
-        plural = "s" if len(file_list) > 1 else ""
-        tell_user(f"Modified {len(file_list)} file{plural}")
-        if _log.isEnabledFor(logging.INFO):
-            tell_user(f"Files: {', '.join(map(str, file_list))}")
+        if root_path.is_file():
+            tell_user(f"Modified file: {patterns[0]}")
+        else:
+            plural = "s" if len(file_list) > 1 else ""
+            tell_user(f"Modified {len(file_list)} file{plural}")
+            if _log.isEnabledFor(logging.INFO):
+                tell_user(f"Files: {', '.join(map(str, file_list))}")
 
     return 0
 

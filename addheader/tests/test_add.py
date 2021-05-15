@@ -21,6 +21,7 @@
 """
 Tests for addheader.add module
 """
+import os
 import sys
 import pytest
 import addheader
@@ -132,15 +133,37 @@ def test_cli(tmp_path):
         addheader.add.main()
 
 
-@pytest.mark.parametrize("line_ending", ["\n", "\r\n"])
+@pytest.mark.parametrize("line_ending", ["\n", "\r\n", "\r"])
 def test_newlines_programmatic(tmp_path, line_ending):
-    # create files with \r\n newlines
     hello = tmp_path / "hello.txt"
     with hello.open("w", newline="") as f:
         f.write("hello, world" + line_ending)
+    # non-universal mode
     fmod = add.FileModifier("header" + line_ending)
     fmod.replace(hello)
     text = hello.open("r", newline="").read()
-    # line-endings should be preserved
+    spit_it_out("non-universal", text, line_ending)
     assert ("header" + line_ending) in text
     assert ("hello, world" + line_ending) in text
+    # universal mode
+    with hello.open("w", newline="") as f:
+        f.write("hello, world" + line_ending)
+    fmod2 = add.FileModifier("header" + line_ending, convert_newlines=True)
+    fmod2.replace(hello)
+    text = hello.open("r", newline="").read()
+    spit_it_out("universal", text, os.linesep)
+    assert ("header" + os.linesep) in text
+    assert ("hello, world" + os.linesep) in text
+
+
+def spit_it_out(title, s, le):
+    print(f"== {title} ==")
+    endl = le.replace("\r", "\\r").replace("\n", "\\n")
+    last_p = 0
+    while last_p > -1:
+        p = s.find(le, last_p)
+        if p >= 0:
+            print(f"{s[last_p: p]}{endl}")
+            last_p = p + 1
+        else:
+            last_p = -1
